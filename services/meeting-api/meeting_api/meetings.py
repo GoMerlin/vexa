@@ -1736,6 +1736,31 @@ async def transcribe_meeting(
     detected_language: Optional[str] = None
     chunk_results: list[tuple[int, dict]] = []  # (chunk_index, response_json)
 
+    MAX_RETRIES = int(os.environ.get("TRANSCRIPTION_MAX_RETRIES", "5"))
+
+    def _parse_retry_after(resp: httpx.Response) -> float:
+        """Honor Retry-After header or parse Groq's 'try again in Xm Ys' message."""
+        # Standard header
+        retry_after = resp.headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(1.0, float(retry_after))
+            except ValueError:
+                pass
+        # Groq embeds 'Please try again in 8m9.5s' in the JSON message
+        try:
+            body = resp.json()
+            msg = body.get("error", {}).get("message", "")
+            import re
+            m = re.search(r"try again in\s+(?:(\d+)m)?([\d.]+)?s", msg)
+            if m:
+                minutes = float(m.group(1) or 0)
+                seconds = float(m.group(2) or 0)
+                return max(1.0, minutes * 60 + seconds + 1.0)
+        except Exception:
+            pass
+        return 5.0
+
     async def transcribe_chunk(idx: int, path: str) -> tuple[int, dict]:
         async with semaphore:
             with open(path, "rb") as f:
@@ -1748,10 +1773,24 @@ async def transcribe_meeting(
             form_data["response_format"] = "verbose_json"
             headers = {"Authorization": f"Bearer {tx_token}"} if tx_token else {}
 
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                resp = await client.post(tx_url, files=files, data=form_data, headers=headers)
+            for attempt in range(MAX_RETRIES):
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    resp = await client.post(tx_url, files=files, data=form_data, headers=headers)
+                # Retry on rate limit or transient server errors
+                if resp.status_code == 429 or resp.status_code in (500, 502, 503, 504):
+                    if attempt == MAX_RETRIES - 1:
+                        resp.raise_for_status()
+                    wait = _parse_retry_after(resp) if resp.status_code == 429 else min(30.0, 2 ** attempt)
+                    logger.warning(
+                        f"Chunk {idx}: {resp.status_code} from transcription service, "
+                        f"retrying in {wait:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
                 resp.raise_for_status()
                 return idx, resp.json()
+            # Should be unreachable due to raise_for_status above
+            raise RuntimeError(f"Chunk {idx} exhausted retries")
 
     try:
         results = await asyncio.gather(
