@@ -1634,68 +1634,161 @@ async def transcribe_meeting(
         logger.error(f"Failed to download recording for meeting {meeting_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to download recording: {e}")
 
-    # 3. Convert to WAV if needed (Whisper requires PCM-decodable formats)
-    if media_format in ("webm", "opus", "ogg", "mp4", "m4a"):
-        try:
-            with tempfile.NamedTemporaryFile(suffix=f".{media_format}", delete=False) as src:
-                src.write(audio_data)
-                src_path = src.name
-            dst_path = src_path.rsplit(".", 1)[0] + ".wav"
-            result = subprocess.run(
-                ["ffmpeg", "-i", src_path, "-ar", "16000", "-ac", "1", "-f", "wav", dst_path, "-y"],
-                capture_output=True, timeout=120,
-            )
-            if result.returncode != 0:
-                logger.error(f"ffmpeg conversion failed: {result.stderr.decode()[:500]}")
-                raise HTTPException(status_code=500, detail="Audio conversion failed")
-            with open(dst_path, "rb") as f:
-                audio_data = f.read()
-            media_format = "wav"
-            os.unlink(src_path)
-            os.unlink(dst_path)
-        except subprocess.TimeoutExpired:
-            raise HTTPException(status_code=500, detail="Audio conversion timed out")
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Audio conversion error: {e}")
-            raise HTTPException(status_code=500, detail=f"Audio conversion error: {e}")
+    # 3. Compress to Opus 24kbps mono 16kHz and split into chunks
+    # Why: transcription services like Groq cap upload size at 25MB. Compressing to
+    # Opus 24kbps lets us fit ~3h of audio per chunk; chunking guarantees we stay
+    # under the limit regardless of total duration.
+    CHUNK_DURATION_SEC = int(os.environ.get("TRANSCRIPTION_CHUNK_SECONDS", "1200"))  # 20 min
+    OPUS_BITRATE = os.environ.get("TRANSCRIPTION_OPUS_BITRATE", "24k")
+    MAX_PARALLEL_CHUNKS = int(os.environ.get("TRANSCRIPTION_PARALLEL_CHUNKS", "3"))
 
-    # 4. Send to transcription service
+    chunk_paths: list[str] = []
+    cleanup_paths: list[str] = []
+    try:
+        with tempfile.NamedTemporaryFile(suffix=f".{media_format}", delete=False) as src:
+            src.write(audio_data)
+            src_path = src.name
+        cleanup_paths.append(src_path)
+        # Free the in-memory copy now that the file is on disk
+        del audio_data
+
+        chunk_dir = tempfile.mkdtemp(prefix=f"vexa-chunks-{meeting_id}-")
+        cleanup_paths.append(chunk_dir)
+        chunk_pattern = os.path.join(chunk_dir, "chunk_%03d.opus")
+
+        # ffmpeg: re-encode to Opus 16kHz mono and segment in one pass
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-i", src_path,
+            "-vn",                      # drop any video stream
+            "-ac", "1",                 # mono
+            "-ar", "16000",             # 16kHz (Whisper-native)
+            "-c:a", "libopus",
+            "-b:a", OPUS_BITRATE,
+            "-application", "voip",     # voice-optimized Opus profile
+            "-f", "segment",
+            "-segment_time", str(CHUNK_DURATION_SEC),
+            "-reset_timestamps", "1",
+            chunk_pattern,
+        ]
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, timeout=600)
+        if result.returncode != 0:
+            logger.error(f"ffmpeg chunking failed: {result.stderr.decode()[:1000]}")
+            raise HTTPException(status_code=500, detail="Audio compression/chunking failed")
+
+        chunk_paths = sorted(
+            os.path.join(chunk_dir, f) for f in os.listdir(chunk_dir) if f.startswith("chunk_")
+        )
+        if not chunk_paths:
+            raise HTTPException(status_code=500, detail="No chunks were produced from the recording")
+
+        logger.info(
+            f"Meeting {meeting_id}: produced {len(chunk_paths)} chunks "
+            f"(target {CHUNK_DURATION_SEC}s @ {OPUS_BITRATE} opus)"
+        )
+    except subprocess.TimeoutExpired:
+        for p in cleanup_paths:
+            try:
+                if os.path.isdir(p):
+                    import shutil; shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.unlink(p)
+            except Exception:
+                pass
+        raise HTTPException(status_code=500, detail="Audio compression timed out")
+    except HTTPException:
+        for p in cleanup_paths:
+            try:
+                if os.path.isdir(p):
+                    import shutil; shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.unlink(p)
+            except Exception:
+                pass
+        raise
+    except Exception as e:
+        for p in cleanup_paths:
+            try:
+                if os.path.isdir(p):
+                    import shutil; shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.unlink(p)
+            except Exception:
+                pass
+        logger.error(f"Audio compression error: {e}")
+        raise HTTPException(status_code=500, detail=f"Audio compression error: {e}")
+
+    # 4. Send each chunk to transcription service in parallel and offset segments
     tx_url = os.environ.get("TRANSCRIPTION_SERVICE_URL", "")
     tx_token = os.environ.get("TRANSCRIPTION_SERVICE_TOKEN", "")
     if not tx_url:
+        for p in cleanup_paths:
+            try:
+                if os.path.isdir(p):
+                    import shutil; shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.unlink(p)
+            except Exception:
+                pass
         raise HTTPException(status_code=503, detail="TRANSCRIPTION_SERVICE_URL not configured")
 
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            files = {"file": (f"recording.{media_format}", audio_data, f"audio/{media_format}")}
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_CHUNKS)
+    detected_language: Optional[str] = None
+    chunk_results: list[tuple[int, dict]] = []  # (chunk_index, response_json)
+
+    async def transcribe_chunk(idx: int, path: str) -> tuple[int, dict]:
+        async with semaphore:
+            with open(path, "rb") as f:
+                chunk_bytes = f.read()
+            files = {"file": (f"chunk_{idx:03d}.opus", chunk_bytes, "audio/ogg")}
             form_data = {"model": os.environ.get("TRANSCRIPTION_MODEL", "whisper-1")}
             if req.language:
                 form_data["language"] = req.language
-            headers = {}
-            if tx_token:
-                headers["Authorization"] = f"Bearer {tx_token}"
+            # Ask for verbose_json so we get word-level segments back
+            form_data["response_format"] = "verbose_json"
+            headers = {"Authorization": f"Bearer {tx_token}"} if tx_token else {}
 
-            resp = await client.post(
-                tx_url,
-                files=files,
-                data=form_data,
-                headers=headers,
-            )
-            resp.raise_for_status()
-            tx_result = resp.json()
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                resp = await client.post(tx_url, files=files, data=form_data, headers=headers)
+                resp.raise_for_status()
+                return idx, resp.json()
+
+    try:
+        results = await asyncio.gather(
+            *[transcribe_chunk(i, p) for i, p in enumerate(chunk_paths)],
+        )
+        chunk_results = sorted(results, key=lambda r: r[0])
     except httpx.HTTPStatusError as e:
-        logger.error(f"Transcription service error: {e.response.status_code} {e.response.text}")
+        logger.error(f"Transcription service error: {e.response.status_code} {e.response.text[:500]}")
         raise HTTPException(status_code=502, detail=f"Transcription service error: {e.response.status_code}")
     except Exception as e:
         logger.error(f"Transcription service request failed: {e}")
         raise HTTPException(status_code=502, detail=f"Transcription service unavailable: {e}")
+    finally:
+        for p in cleanup_paths:
+            try:
+                if os.path.isdir(p):
+                    import shutil; shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.unlink(p)
+            except Exception:
+                pass
 
-    # 5. Parse and filter segments
-    segments = tx_result.get("segments", [])
-    segments = [s for s in segments if 'start' in s and 'end' in s and s.get('text', '').strip()]
-    detected_language = tx_result.get("language", req.language or "unknown")
+    # 5. Merge chunk segments with timestamp offsets
+    segments: list[dict] = []
+    for idx, tx_result in chunk_results:
+        chunk_offset = idx * CHUNK_DURATION_SEC
+        if detected_language is None:
+            detected_language = tx_result.get("language")
+        for s in tx_result.get("segments", []):
+            if 'start' not in s or 'end' not in s or not s.get('text', '').strip():
+                continue
+            segments.append({
+                **s,
+                "start": float(s["start"]) + chunk_offset,
+                "end": float(s["end"]) + chunk_offset,
+            })
+    detected_language = detected_language or req.language or "unknown"
 
     # 6. Map speakers using speaker_events from meeting.data
     meeting_data = meeting.data or {}
