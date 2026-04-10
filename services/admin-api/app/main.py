@@ -482,7 +482,7 @@ async def update_user(user_id: int, user_update: UserUpdate, db: AsyncSession = 
              summary="Generate a new API token for a user")
 async def create_token_for_user(
     user_id: int,
-    scope: str = "user",
+    scope: str = "bot",
     scopes: Optional[str] = None,
     name: Optional[str] = None,
     expires_in: Optional[int] = None,
