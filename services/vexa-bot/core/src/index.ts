@@ -2090,7 +2090,7 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
       }
     }
 
-    if (!botConfig.videoReceiveEnabled) {
+    if (!botConfig.videoReceiveEnabled && process.env.FORCE_VIDEO_RECEIVE !== 'true') {
       try {
         await context.addInitScript(getVideoBlockInitScript());
         log('[Bot] Video IN: blocked (authenticated, saving CPU)');
@@ -2168,7 +2168,7 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
 
     // Video IN (receive participant video): controlled by videoReceiveEnabled (default off)
     // When off, disables incoming video tracks to save ~87% CPU per bot.
-    if (!botConfig.videoReceiveEnabled) {
+    if (!botConfig.videoReceiveEnabled && process.env.FORCE_VIDEO_RECEIVE !== 'true') {
       try {
         await context.addInitScript(getVideoBlockInitScript());
         log('[Bot] Video IN: blocked (Teams, saving CPU)');
@@ -2215,7 +2215,7 @@ export async function runBot(botConfig: BotConfig): Promise<void> {// Store botC
 
     // Video IN (receive participant video): controlled by videoReceiveEnabled (default off)
     // When off, disables incoming video tracks to save ~87% CPU per bot.
-    if (!botConfig.videoReceiveEnabled) {
+    if (!botConfig.videoReceiveEnabled && process.env.FORCE_VIDEO_RECEIVE !== 'true') {
       try {
         await context.addInitScript(getVideoBlockInitScript());
         log('[Bot] Video IN: blocked (saving CPU)');
