@@ -6,10 +6,30 @@ without hitting the backend every time. Reconciles with backend on startup.
 
 import json
 import logging
+import os
 import time
 from typing import Optional
 
 logger = logging.getLogger("runtime_api.state")
+
+
+def _pid_alive(pid: int) -> bool:
+    """Check if a PID is alive (not a zombie). Mirrors backends.process._pid_alive."""
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    try:
+        with open(f"/proc/{pid}/status", "r") as f:
+            for line in f:
+                if line.startswith("State:"):
+                    state = line.split()[1]
+                    return state not in ("Z", "X", "x")
+    except (FileNotFoundError, OSError):
+        return False
+    return True
 
 KEY_PREFIX = "runtime:container:"
 STOPPED_TTL = 86400  # 24h for stopped/failed entries
@@ -47,7 +67,12 @@ async def set_stopped(redis, name: str, status: str = "stopped", exit_code: int 
 
 
 async def list_containers(redis, user_id: str = None, profile: str = None) -> list[dict]:
-    """List all tracked containers, optionally filtered."""
+    """List all tracked containers, optionally filtered.
+
+    Performs synchronous PID liveness checks on entries marked 'running' to
+    eliminate the race where a dead process is still in the registry because
+    the periodic reaper hasn't swept it yet.
+    """
     results = []
     async for key in redis.scan_iter(f"{KEY_PREFIX}*"):
         raw = await redis.get(key)
@@ -58,7 +83,24 @@ async def list_containers(redis, user_id: str = None, profile: str = None) -> li
             continue
         if profile and data.get("profile") != profile:
             continue
-        data["name"] = key.removeprefix(KEY_PREFIX)
+
+        name = key.removeprefix(KEY_PREFIX) if isinstance(key, str) else key.decode().removeprefix(KEY_PREFIX)
+
+        # Sweep dead processes still marked as running
+        if data.get("status") == "running":
+            pid = data.get("pid")
+            if pid and not _pid_alive(pid):
+                logger.warning(
+                    f"list_containers: process {name} (PID={pid}) is dead "
+                    f"but still marked 'running'; sweeping it now."
+                )
+                await set_stopped(redis, name, status="stopped", exit_code=0)
+                # Re-fetch the updated record so callers see the corrected status
+                raw = await redis.get(key)
+                if raw:
+                    data = json.loads(raw)
+
+        data["name"] = name
         results.append(data)
     return results
 
@@ -67,7 +109,12 @@ async def list_containers(redis, user_id: str = None, profile: str = None) -> li
 async def count_user_containers(
     redis, user_id: str, profile: str = None
 ) -> int:
-    """Count running containers for a user, optionally filtered by profile."""
+    """Count running containers for a user, optionally filtered by profile.
+
+    Performs synchronous PID liveness checks on entries marked 'running' to
+    eliminate the race condition where a dead process is still in the registry
+    because the periodic reaper hasn't swept it yet.
+    """
     count = 0
     async for key in redis.scan_iter(f"{KEY_PREFIX}*"):
         raw = await redis.get(key)
@@ -80,6 +127,19 @@ async def count_user_containers(
             continue
         if profile and data.get("profile") != profile:
             continue
+
+        # Synchronously verify the PID is actually alive — fixes the race
+        # where the reaper hasn't yet marked the process as exited.
+        pid = data.get("pid")
+        if pid and not _pid_alive(pid):
+            name = key.removeprefix(KEY_PREFIX) if isinstance(key, str) else key.decode().removeprefix(KEY_PREFIX)
+            logger.warning(
+                f"count_user_containers: process {name} (PID={pid}) is dead "
+                f"but still marked 'running'; sweeping it now."
+            )
+            await set_stopped(redis, name, status="stopped", exit_code=0)
+            continue
+
         count += 1
     return count
 
