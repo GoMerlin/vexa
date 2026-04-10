@@ -1,8 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
 import { cookies } from "next/headers";
+import crypto from "crypto";
 
 const ADMIN_COOKIE_NAME = "vexa-admin-session";
 const COOKIE_MAX_AGE = 60 * 60 * 24; // 24 hours
+
+function verifyCookieValue(signed: string): string | null {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) return null;
+  const dotIndex = signed.lastIndexOf(".");
+  if (dotIndex === -1) return null;
+  const payload = signed.substring(0, dotIndex);
+  const signature = signed.substring(dotIndex + 1);
+  const expected = crypto.createHmac("sha256", secret).update(payload).digest("hex");
+  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+    return null;
+  }
+  return payload;
+}
 
 /**
  * Verify admin session from cookie
@@ -16,8 +31,12 @@ async function verifyAdminSession(): Promise<boolean> {
       return false;
     }
 
+    // Verify HMAC signature before trusting the payload
+    const payload = verifyCookieValue(sessionCookie.value);
+    if (!payload) return false;
+
     const sessionData = JSON.parse(
-      Buffer.from(sessionCookie.value, "base64").toString()
+      Buffer.from(payload, "base64").toString()
     );
 
     // Check if session is expired (24 hours)
